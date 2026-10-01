@@ -1,0 +1,8 @@
+{
+  "name": "contact-scraper",
+  "version": "1.0.0",
+  "main": "scraper-server.js",
+  "scripts": {
+    "start": "node scraper-server.js"
+  }
+}

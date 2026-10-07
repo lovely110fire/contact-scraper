@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import re
 from urllib.parse import quote_plus
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -13,8 +14,11 @@ USER_AGENT = (
 
 BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
 
-# One request = one fresh browser. No persistent state, no dead references.
-# Lock ensures only one browser runs at a time on the 512 MB free tier.
+# Hard ceiling per request. If we blow this, Render returns 520.
+# Keep comfortably under Render's 100s HTTP timeout.
+LINKS_TIMEOUT = 85
+DETAILS_TIMEOUT = 40
+
 _scrape_lock = asyncio.Lock()
 
 CHROMIUM_ARGS = [
@@ -22,6 +26,7 @@ CHROMIUM_ARGS = [
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
+    "--disable-software-rasterizer",
     "--disable-background-networking",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
@@ -30,20 +35,20 @@ CHROMIUM_ARGS = [
     "--disable-component-update",
     "--disable-default-apps",
     "--disable-extensions",
-    "--disable-features=TranslateUI,IsolateOrigins,site-per-process,AudioServiceOutOfProcess",
+    "--disable-features=TranslateUI,IsolateOrigins,site-per-process,AudioServiceOutOfProcess,Translate",
     "--disable-ipc-flooding-protection",
     "--disable-renderer-backgrounding",
     "--disable-sync",
+    "--disable-notifications",
     "--metrics-recording-only",
     "--mute-audio",
     "--hide-scrollbars",
     "--disable-blink-features=AutomationControlled",
-    "--memory-pressure-off",
-    "--js-flags=--max-old-space-size=256",
+    "--js-flags=--max-old-space-size=180",
+    "--renderer-process-limit=1",
 ]
 
 
-# Kept for compatibility with main.py — nothing to warm up now.
 async def startup():
     pass
 
@@ -68,19 +73,34 @@ async def _dismiss_consent(page):
         pass
 
 
-async def _run_in_fresh_browser(work):
+def _normalize_place_url(url: str) -> str:
     """
-    Launch Chromium, run `work(page_factory, context)`, then shut everything down.
-    page_factory() returns a new page with resource blocking already set up.
+    URLs collected from the search-results feed look like:
+      /maps/place/<name>/data=!4m7!3m6!1s...!8m2!3d34.04!4d-118.25!...
+    They render only inside an existing Maps session. For a standalone load,
+    Google needs the /@lat,lng,17z/ segment. The coords are already in the
+    data param (!3d<lat>!4d<lng>); extract and inject them.
     """
+    if "/@" in url:
+        return url
+    m = re.search(r"!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)", url)
+    if not m:
+        return url
+    lat, lng = m.group(1), m.group(2)
+    return re.sub(r"/data=", f"/@{lat},{lng},17z/data=", url, count=1)
+
+
+async def _run_in_fresh_browser(work, timeout_s: int):
+    """Launch Chromium, run work, tear everything down. Hard timeout."""
     async with _scrape_lock:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
             try:
                 context = await browser.new_context(
                     user_agent=USER_AGENT,
-                    viewport={"width": 1366, "height": 900},
+                    viewport={"width": 1280, "height": 720},
                     locale="en-US",
+                    java_script_enabled=True,
                 )
 
                 async def new_page():
@@ -89,7 +109,9 @@ async def _run_in_fresh_browser(work):
                     return p
 
                 try:
-                    return await work(new_page, context)
+                    return await asyncio.wait_for(
+                        work(new_page, context), timeout=timeout_s
+                    )
                 finally:
                     try:
                         await context.close()
@@ -100,6 +122,10 @@ async def _run_in_fresh_browser(work):
                     await browser.close()
                 except Exception:
                     pass
+                # Give the OS a moment to reclaim Chromium's RSS before we
+                # unblock the next request.
+                await asyncio.sleep(0.5)
+                gc.collect()
 
 
 # ---------- STAGE 1: collect profile links ----------
@@ -111,7 +137,6 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await _dismiss_consent(page)
 
-        # Google landed us directly on a single place page.
         if "/maps/place/" in page.url:
             return [page.url]
 
@@ -128,7 +153,7 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
             await page.evaluate(
                 f"document.querySelector('{feed_selector}').scrollBy(0, 3000)"
             )
-            await asyncio.sleep(1.3)
+            await asyncio.sleep(1.2)
 
             count = await page.evaluate(
                 "document.querySelectorAll('a[href*=\"/maps/place/\"]').length"
@@ -141,7 +166,7 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
                 break
             if count == last_count:
                 stagnant += 1
-                if stagnant >= 4:
+                if stagnant >= 3:
                     break
             else:
                 stagnant = 0
@@ -161,9 +186,13 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
                 return out;
             }"""
         )
-        return urls[:max_results]
+        normalized = [_normalize_place_url(u) for u in urls]
+        return normalized[:max_results]
 
-    return await _run_in_fresh_browser(work)
+    try:
+        return await _run_in_fresh_browser(work, timeout_s=LINKS_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"/links timed out after {LINKS_TIMEOUT}s")
 
 
 # ---------- STAGE 2: details for one profile ----------
@@ -192,11 +221,13 @@ async def get_place_details(url: str):
     if "/maps/place/" not in url and "google.com/maps" not in url:
         raise ValueError("Not a Google Maps URL")
 
+    nav_url = _normalize_place_url(url)
+
     async def work(new_page, context):
         page = await new_page()
         data = {"url": url}
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            await page.goto(nav_url, wait_until="domcontentloaded", timeout=25000)
             await _dismiss_consent(page)
             await page.wait_for_selector("h1", timeout=10000)
             await asyncio.sleep(0.8)
@@ -236,4 +267,7 @@ async def get_place_details(url: str):
             data["error"] = str(e)
             return data
 
-    return await _run_in_fresh_browser(work)
+    try:
+        return await _run_in_fresh_browser(work, timeout_s=DETAILS_TIMEOUT)
+    except asyncio.TimeoutError:
+        return {"url": url, "error": f"timed out after {DETAILS_TIMEOUT}s"}

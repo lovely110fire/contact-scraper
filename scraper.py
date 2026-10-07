@@ -1,11 +1,7 @@
 import asyncio
 import re
 from urllib.parse import quote_plus
-from playwright.async_api import (
-    async_playwright,
-    Browser,
-    TimeoutError as PWTimeout,
-)
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 GMAPS_URL = "https://www.google.com/maps/search/{query}?hl=en"
 
@@ -17,87 +13,43 @@ USER_AGENT = (
 
 BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
 
-# Restart browser every N requests to prevent memory bloat on free tier.
-RESTART_AFTER_REQUESTS = 8
-
-_pw = None
-_browser: Browser | None = None
+# One request = one fresh browser. No persistent state, no dead references.
+# Lock ensures only one browser runs at a time on the 512 MB free tier.
 _scrape_lock = asyncio.Lock()
-_request_count = 0
+
+CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-breakpad",
+    "--disable-client-side-phishing-detection",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-features=TranslateUI,IsolateOrigins,site-per-process,AudioServiceOutOfProcess",
+    "--disable-ipc-flooding-protection",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--hide-scrollbars",
+    "--disable-blink-features=AutomationControlled",
+    "--memory-pressure-off",
+    "--js-flags=--max-old-space-size=256",
+]
 
 
+# Kept for compatibility with main.py — nothing to warm up now.
 async def startup():
-    """Initialize playwright. Browser is launched lazily on first request."""
-    global _pw
-    _pw = await async_playwright().start()
+    pass
 
 
 async def shutdown():
-    global _browser, _pw
-    if _browser:
-        try:
-            await _browser.close()
-        except Exception:
-            pass
-        _browser = None
-    if _pw:
-        await _pw.stop()
-        _pw = None
-
-
-async def _launch_browser():
-    """Launch Chromium with low-memory flags (no --single-process; it crashes)."""
-    return await _pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-background-networking",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-breakpad",
-            "--disable-client-side-phishing-detection",
-            "--disable-component-update",
-            "--disable-default-apps",
-            "--disable-extensions",
-            "--disable-features=TranslateUI,IsolateOrigins,site-per-process,AudioServiceOutOfProcess",
-            "--disable-ipc-flooding-protection",
-            "--disable-renderer-backgrounding",
-            "--disable-sync",
-            "--metrics-recording-only",
-            "--mute-audio",
-            "--hide-scrollbars",
-            "--disable-blink-features=AutomationControlled",
-            "--memory-pressure-off",
-            "--js-flags=--max-old-space-size=256",
-        ],
-    )
-
-
-async def _ensure_browser():
-    """Make sure we have a live browser. Relaunch if dead or hit restart threshold."""
-    global _browser, _request_count
-
-    needs_restart = (
-        _browser is None
-        or not _browser.is_connected()
-        or _request_count >= RESTART_AFTER_REQUESTS
-    )
-
-    if needs_restart:
-        if _browser is not None:
-            try:
-                await _browser.close()
-            except Exception:
-                pass
-            _browser = None
-        _request_count = 0
-        _browser = await _launch_browser()
-
-    _request_count += 1
-    return _browser
+    pass
 
 
 async def _block_heavy(route):
@@ -105,14 +57,6 @@ async def _block_heavy(route):
         await route.abort()
     else:
         await route.continue_()
-
-
-async def _new_context(browser):
-    return await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1366, "height": 900},
-        locale="en-US",
-    )
 
 
 async def _dismiss_consent(page):
@@ -124,77 +68,102 @@ async def _dismiss_consent(page):
         pass
 
 
+async def _run_in_fresh_browser(work):
+    """
+    Launch Chromium, run `work(page_factory, context)`, then shut everything down.
+    page_factory() returns a new page with resource blocking already set up.
+    """
+    async with _scrape_lock:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            try:
+                context = await browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1366, "height": 900},
+                    locale="en-US",
+                )
+
+                async def new_page():
+                    p = await context.new_page()
+                    await p.route("**/*", _block_heavy)
+                    return p
+
+                try:
+                    return await work(new_page, context)
+                finally:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+
 # ---------- STAGE 1: collect profile links ----------
 
 async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 40):
-    async with _scrape_lock:
-        browser = await _ensure_browser()
-        context = await _new_context(browser)
+    async def work(new_page, context):
+        page = await new_page()
+        url = GMAPS_URL.format(query=quote_plus(query))
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await _dismiss_consent(page)
+
+        # Google landed us directly on a single place page.
+        if "/maps/place/" in page.url:
+            return [page.url]
+
+        feed_selector = 'div[role="feed"]'
         try:
-            page = await context.new_page()
-            await page.route("**/*", _block_heavy)
+            await page.wait_for_selector(feed_selector, timeout=15000)
+        except PWTimeout:
+            return []
 
-            url = GMAPS_URL.format(query=quote_plus(query))
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await _dismiss_consent(page)
+        last_count = 0
+        stagnant = 0
 
-            if "/maps/place/" in page.url:
-                return [page.url]
-
-            feed_selector = 'div[role="feed"]'
-            try:
-                await page.wait_for_selector(feed_selector, timeout=15000)
-            except PWTimeout:
-                return []
-
-            last_count = 0
-            stagnant = 0
-
-            for _ in range(max_scrolls):
-                await page.evaluate(
-                    f"document.querySelector('{feed_selector}').scrollBy(0, 3000)"
-                )
-                await asyncio.sleep(1.3)
-
-                count = await page.evaluate(
-                    "document.querySelectorAll('a[href*=\"/maps/place/\"]').length"
-                )
-
-                end_marker_seen = await page.evaluate(
-                    "!!document.querySelector('p.fontBodyMedium span.HlvSq')"
-                )
-
-                if count >= max_results or end_marker_seen:
-                    break
-
-                if count == last_count:
-                    stagnant += 1
-                    if stagnant >= 4:
-                        break
-                else:
-                    stagnant = 0
-                last_count = count
-
-            urls = await page.evaluate(
-                """() => {
-                    const anchors = document.querySelectorAll('a[href*="/maps/place/"]');
-                    const seen = new Set();
-                    const out = [];
-                    anchors.forEach(a => {
-                        if (!seen.has(a.href)) {
-                            seen.add(a.href);
-                            out.push(a.href);
-                        }
-                    });
-                    return out;
-                }"""
+        for _ in range(max_scrolls):
+            await page.evaluate(
+                f"document.querySelector('{feed_selector}').scrollBy(0, 3000)"
             )
-            return urls[:max_results]
-        finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            await asyncio.sleep(1.3)
+
+            count = await page.evaluate(
+                "document.querySelectorAll('a[href*=\"/maps/place/\"]').length"
+            )
+            end_marker_seen = await page.evaluate(
+                "!!document.querySelector('p.fontBodyMedium span.HlvSq')"
+            )
+
+            if count >= max_results or end_marker_seen:
+                break
+            if count == last_count:
+                stagnant += 1
+                if stagnant >= 4:
+                    break
+            else:
+                stagnant = 0
+            last_count = count
+
+        urls = await page.evaluate(
+            """() => {
+                const anchors = document.querySelectorAll('a[href*="/maps/place/"]');
+                const seen = new Set();
+                const out = [];
+                anchors.forEach(a => {
+                    if (!seen.has(a.href)) {
+                        seen.add(a.href);
+                        out.push(a.href);
+                    }
+                });
+                return out;
+            }"""
+        )
+        return urls[:max_results]
+
+    return await _run_in_fresh_browser(work)
 
 
 # ---------- STAGE 2: details for one profile ----------
@@ -223,13 +192,10 @@ async def get_place_details(url: str):
     if "/maps/place/" not in url and "google.com/maps" not in url:
         raise ValueError("Not a Google Maps URL")
 
-    async with _scrape_lock:
-        browser = await _ensure_browser()
-        context = await _new_context(browser)
+    async def work(new_page, context):
+        page = await new_page()
         data = {"url": url}
         try:
-            page = await context.new_page()
-            await page.route("**/*", _block_heavy)
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
             await _dismiss_consent(page)
             await page.wait_for_selector("h1", timeout=10000)
@@ -247,9 +213,7 @@ async def get_place_details(url: str):
             data["website"] = await _safe_attr(
                 page, 'a[data-item-id="authority"]', "href"
             )
-            data["category"] = await _safe_text(
-                page, 'button[jsaction*="category"]'
-            )
+            data["category"] = await _safe_text(page, 'button[jsaction*="category"]')
             data["rating"] = await _safe_text(
                 page, "div.F7nice span[aria-hidden='true']"
             )
@@ -271,8 +235,5 @@ async def get_place_details(url: str):
         except Exception as e:
             data["error"] = str(e)
             return data
-        finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+
+    return await _run_in_fresh_browser(work)

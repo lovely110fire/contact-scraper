@@ -75,19 +75,39 @@ async def _dismiss_consent(page):
 
 def _normalize_place_url(url: str) -> str:
     """
-    URLs collected from the search-results feed look like:
-      /maps/place/<name>/data=!4m7!3m6!1s...!8m2!3d34.04!4d-118.25!...
-    They render only inside an existing Maps session. For a standalone load,
-    Google needs the /@lat,lng,17z/ segment. The coords are already in the
-    data param (!3d<lat>!4d<lng>); extract and inject them.
+    Transform a search-feed /maps/place/ URL into the canonical direct-link
+    form that renders as a standalone place page.
+
+    Three changes:
+    1. Insert /@lat,lng,17z/ segment if missing (coords come from !3d/!4d).
+    2. Strip the trailing !19sChIJ... segment, which tells Google to render
+       inside a search-results layout (where h1 is hidden).
+    3. Drop search-feed query params like ?authuser=0&rclk=1 for the same
+       reason.
     """
-    if "/@" in url:
-        return url
-    m = re.search(r"!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)", url)
-    if not m:
-        return url
-    lat, lng = m.group(1), m.group(2)
-    return re.sub(r"/data=", f"/@{lat},{lng},17z/data=", url, count=1)
+    # 1. Add /@lat,lng,17z/
+    if "/@" not in url:
+        m = re.search(r"!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)", url)
+        if m:
+            lat, lng = m.group(1), m.group(2)
+            url = re.sub(r"/data=", f"/@{lat},{lng},17z/data=", url, count=1)
+
+    # 2. Separate path and query, work on path.
+    path, _sep, _query = url.partition("?")
+
+    # 3. Remove !19s<cid> segment and decrement the enclosing counts
+    #    (!4m7!3m6 → !4m6!3m5, !4m8!3m7 → !4m7!3m6, etc.).
+    if "!19s" in path:
+        path = re.sub(r"!19s[^!]+", "", path)
+        path = re.sub(
+            r"!4m(\d+)!3m(\d+)",
+            lambda m: f"!4m{int(m.group(1)) - 1}!3m{int(m.group(2)) - 1}",
+            path,
+            count=1,
+        )
+
+    # 4. Drop the query string entirely — it only carries search-feed state.
+    return path
 
 
 async def _run_in_fresh_browser(work, timeout_s: int):
@@ -199,7 +219,9 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
 
 async def _safe_text(page, selector, timeout=2500):
     try:
-        return (await page.locator(selector).first.inner_text(timeout=timeout)).strip()
+        # text_content works for hidden elements too; inner_text would skip them.
+        value = await page.locator(selector).first.text_content(timeout=timeout)
+        return value.strip() if value else None
     except Exception:
         return None
 
@@ -229,7 +251,7 @@ async def get_place_details(url: str):
         try:
             await page.goto(nav_url, wait_until="domcontentloaded", timeout=25000)
             await _dismiss_consent(page)
-            await page.wait_for_selector("h1", timeout=10000)
+            await page.wait_for_selector("h1", timeout=10000, state="attached")
             await asyncio.sleep(0.8)
 
             data["name"] = await _safe_text(page, "h1")

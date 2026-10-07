@@ -17,23 +17,43 @@ USER_AGENT = (
 
 BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
 
+# Restart browser every N requests to prevent memory bloat on free tier.
+RESTART_AFTER_REQUESTS = 8
+
 _pw = None
 _browser: Browser | None = None
-_scrape_lock = asyncio.Lock()  # 512 MB RAM = one scrape at a time
+_scrape_lock = asyncio.Lock()
+_request_count = 0
 
 
 async def startup():
-    global _pw, _browser
+    """Initialize playwright. Browser is launched lazily on first request."""
+    global _pw
     _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
+
+
+async def shutdown():
+    global _browser, _pw
+    if _browser:
+        try:
+            await _browser.close()
+        except Exception:
+            pass
+        _browser = None
+    if _pw:
+        await _pw.stop()
+        _pw = None
+
+
+async def _launch_browser():
+    """Launch Chromium with low-memory flags (no --single-process; it crashes)."""
+    return await _pw.chromium.launch(
         headless=True,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--single-process",
-            "--no-zygote",
             "--disable-background-networking",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
@@ -42,7 +62,7 @@ async def startup():
             "--disable-component-update",
             "--disable-default-apps",
             "--disable-extensions",
-            "--disable-features=TranslateUI,IsolateOrigins,site-per-process",
+            "--disable-features=TranslateUI,IsolateOrigins,site-per-process,AudioServiceOutOfProcess",
             "--disable-ipc-flooding-protection",
             "--disable-renderer-backgrounding",
             "--disable-sync",
@@ -50,18 +70,34 @@ async def startup():
             "--mute-audio",
             "--hide-scrollbars",
             "--disable-blink-features=AutomationControlled",
+            "--memory-pressure-off",
+            "--js-flags=--max-old-space-size=256",
         ],
     )
 
 
-async def shutdown():
-    global _browser, _pw
-    if _browser:
-        await _browser.close()
-        _browser = None
-    if _pw:
-        await _pw.stop()
-        _pw = None
+async def _ensure_browser():
+    """Make sure we have a live browser. Relaunch if dead or hit restart threshold."""
+    global _browser, _request_count
+
+    needs_restart = (
+        _browser is None
+        or not _browser.is_connected()
+        or _request_count >= RESTART_AFTER_REQUESTS
+    )
+
+    if needs_restart:
+        if _browser is not None:
+            try:
+                await _browser.close()
+            except Exception:
+                pass
+            _browser = None
+        _request_count = 0
+        _browser = await _launch_browser()
+
+    _request_count += 1
+    return _browser
 
 
 async def _block_heavy(route):
@@ -71,8 +107,8 @@ async def _block_heavy(route):
         await route.continue_()
 
 
-async def _new_context():
-    return await _browser.new_context(
+async def _new_context(browser):
+    return await browser.new_context(
         user_agent=USER_AGENT,
         viewport={"width": 1366, "height": 900},
         locale="en-US",
@@ -91,12 +127,9 @@ async def _dismiss_consent(page):
 # ---------- STAGE 1: collect profile links ----------
 
 async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 40):
-    """Return a de-duplicated list of Google Maps place URLs for a query."""
-    if _browser is None:
-        raise RuntimeError("Browser not started.")
-
     async with _scrape_lock:
-        context = await _new_context()
+        browser = await _ensure_browser()
+        context = await _new_context(browser)
         try:
             page = await context.new_page()
             await page.route("**/*", _block_heavy)
@@ -105,7 +138,6 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(page)
 
-            # If Google landed us directly on a place page, return just that one.
             if "/maps/place/" in page.url:
                 return [page.url]
 
@@ -117,7 +149,6 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
 
             last_count = 0
             stagnant = 0
-            end_marker_seen = False
 
             for _ in range(max_scrolls):
                 await page.evaluate(
@@ -129,7 +160,6 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
                     "document.querySelectorAll('a[href*=\"/maps/place/\"]').length"
                 )
 
-                # Google shows "You've reached the end of the list" when done.
                 end_marker_seen = await page.evaluate(
                     "!!document.querySelector('p.fontBodyMedium span.HlvSq')"
                 )
@@ -161,7 +191,10 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
             )
             return urls[:max_results]
         finally:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
 
 
 # ---------- STAGE 2: details for one profile ----------
@@ -187,15 +220,12 @@ def _clean(prefix, value):
 
 
 async def get_place_details(url: str):
-    """Open one Google Maps place URL and extract its details."""
-    if _browser is None:
-        raise RuntimeError("Browser not started.")
-
     if "/maps/place/" not in url and "google.com/maps" not in url:
         raise ValueError("Not a Google Maps URL")
 
     async with _scrape_lock:
-        context = await _new_context()
+        browser = await _ensure_browser()
+        context = await _new_context(browser)
         data = {"url": url}
         try:
             page = await context.new_page()
@@ -242,4 +272,7 @@ async def get_place_details(url: str):
             data["error"] = str(e)
             return data
         finally:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass

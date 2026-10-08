@@ -16,7 +16,12 @@ BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
 
 # Hard ceiling per request. If we blow this, Render returns 520.
 # Keep comfortably under Render's 100s HTTP timeout.
-LINKS_TIMEOUT = 85
+# Per-request timeouts (seconds). /links scales with limit so a limit=200
+# request has room to scroll through all batches, capped at 95s to stay
+# just under Render's 100s HTTP timeout.
+LINKS_BASE_TIMEOUT = 30
+LINKS_PER_RESULT = 0.4   # ~0.4s budget per expected result
+LINKS_MAX_TIMEOUT = 95
 DETAILS_TIMEOUT = 40
 
 _scrape_lock = asyncio.Lock()
@@ -150,7 +155,7 @@ async def _run_in_fresh_browser(work, timeout_s: int):
 
 # ---------- STAGE 1: collect profile links ----------
 
-async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 40):
+async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 120):
     async def work(new_page, context):
         page = await new_page()
         url = GMAPS_URL.format(query=quote_plus(query))
@@ -166,27 +171,54 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
         except PWTimeout:
             return []
 
+        # Scroll by targeting the LAST loaded result and bringing it into
+        # view — this is what Google's lazy loader actually responds to.
+        # scrollBy on the feed container often does nothing because the
+        # container isn't the real scrollable element at every width.
+        scroll_js = """() => {
+            const feed = document.querySelector('div[role="feed"]');
+            if (!feed) return 0;
+            const items = feed.querySelectorAll('a[href*="/maps/place/"]');
+            if (items.length > 0) {
+                items[items.length - 1].scrollIntoView({block: 'end'});
+            }
+            // Also push the feed scroll to the bottom as a backup.
+            feed.scrollTop = feed.scrollHeight;
+            return items.length;
+        }"""
+
         last_count = 0
         stagnant = 0
 
         for _ in range(max_scrolls):
-            await page.evaluate(
-                f"document.querySelector('{feed_selector}').scrollBy(0, 3000)"
-            )
-            await asyncio.sleep(1.2)
+            count = await page.evaluate(scroll_js)
 
-            count = await page.evaluate(
-                "document.querySelectorAll('a[href*=\"/maps/place/\"]').length"
-            )
+            # Wait up to 4s for the result count to grow after a scroll.
+            # Poll frequently so a fast load unblocks us right away.
+            grew = False
+            for _ in range(20):
+                await asyncio.sleep(0.2)
+                new_count = await page.evaluate(
+                    "document.querySelectorAll('a[href*=\"/maps/place/\"]').length"
+                )
+                if new_count > count:
+                    grew = True
+                    count = new_count
+                    break
+
             end_marker_seen = await page.evaluate(
-                "!!document.querySelector('p.fontBodyMedium span.HlvSq')"
+                """() => !!document.querySelector(
+                    'p.fontBodyMedium span.HlvSq, div.m6QErb span.HlvSq'
+                )"""
             )
 
             if count >= max_results or end_marker_seen:
                 break
-            if count == last_count:
+
+            if not grew and count == last_count:
                 stagnant += 1
-                if stagnant >= 3:
+                # Give Google extra tries before declaring end-of-list.
+                if stagnant >= 5:
                     break
             else:
                 stagnant = 0
@@ -209,10 +241,18 @@ async def collect_links(query: str, max_results: int = 100, max_scrolls: int = 4
         normalized = [_normalize_place_url(u) for u in urls]
         return normalized[:max_results]
 
+    # Scale timeout with limit; cap at Render's HTTP ceiling.
+    timeout_s = min(
+        LINKS_MAX_TIMEOUT,
+        int(LINKS_BASE_TIMEOUT + LINKS_PER_RESULT * max_results),
+    )
     try:
-        return await _run_in_fresh_browser(work, timeout_s=LINKS_TIMEOUT)
+        return await _run_in_fresh_browser(work, timeout_s=timeout_s)
     except asyncio.TimeoutError:
-        raise RuntimeError(f"/links timed out after {LINKS_TIMEOUT}s")
+        raise RuntimeError(
+            f"/links timed out after {timeout_s}s. "
+            f"Try a smaller limit; Render free tier has a 100s HTTP limit."
+        )
 
 
 # ---------- STAGE 2: details for one profile ----------
